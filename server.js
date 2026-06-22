@@ -1,29 +1,15 @@
 const express = require('express');
-const fs      = require('fs');
 const path    = require('path');
-const multer  = require('multer');
+const { createClient } = require('@supabase/supabase-js');
 
-const app     = express();
-const PORT    = 3000;
-const DATA    = path.join(__dirname, 'public', 'data');
-const PUBLIC  = path.join(__dirname, 'public');
+const app  = express();
+const PORT = process.env.PORT || 3000;
 
-// ── Multer: guarda catálogos xlsx directamente en public/ ────────────────────
-// Cada archivo subido pisa el anterior del mismo nombre — eso es intencional:
-// variables.xlsx y referencia.xlsx son catálogos globales compartidos.
-const catalogStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, PUBLIC),
-  filename:    (_req, file,  cb) => cb(null, file.originalname),
-});
-const catalogFilter = (_req, file, cb) => {
-  const ok = /\.(xlsx|xls)$/i.test(file.originalname);
-  cb(ok ? null : new Error('Solo se permiten archivos .xlsx o .xls'), ok);
-};
-const uploadCatalog = multer({
-  storage: catalogStorage,
-  fileFilter: catalogFilter,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB máx
-});
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+  console.warn('⚠️  Faltan SUPABASE_URL / SUPABASE_KEY como variables de entorno.');
+}
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -41,31 +27,49 @@ function broadcast(projectId, payload) {
   }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function projectFile(id) {
-  return path.join(DATA, `${id}.json`);
+// ── Helpers (antes leían/escribían archivos, ahora hablan con Supabase) ──────
+// La forma del objeto "project" es EXACTAMENTE la misma que antes:
+// { id, name, createdBy, createdAt, entries: [...] }
+// Se guarda completa dentro de la columna jsonb "data".
+
+async function loadProject(id) {
+  const { data, error } = await supabase
+    .from('projects')
+    .select('data')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) { console.error('loadProject error:', error.message); return null; }
+  return data ? data.data : null;
 }
-function loadProject(id) {
-  try { return JSON.parse(fs.readFileSync(projectFile(id), 'utf8')); }
-  catch (_) { return null; }
+
+async function saveProject(id, project) {
+  const { error } = await supabase
+    .from('projects')
+    .upsert({ id, data: project });
+  if (error) throw error;
 }
-function saveProject(id, data) {
-  fs.writeFileSync(projectFile(id), JSON.stringify(data, null, 2), 'utf8');
+
+async function deleteProjectRow(id) {
+  const { error } = await supabase.from('projects').delete().eq('id', id);
+  if (error) throw error;
 }
-function listProjects() {
-  if (!fs.existsSync(DATA)) return [];
-  return fs.readdirSync(DATA)
-    .filter(f => f.endsWith('.json'))
-    .map(f => {
-      try { return JSON.parse(fs.readFileSync(path.join(DATA, f), 'utf8')); }
-      catch (_) { return null; }
-    })
-    .filter(Boolean)
+
+async function listProjects() {
+  const { data, error } = await supabase.from('projects').select('data');
+  if (error) { console.error('listProjects error:', error.message); return []; }
+  return data
+    .map(row => row.data)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+// Envuelve handlers async para no perder errores no controlados
+const h = fn => (req, res) => fn(req, res).catch(err => {
+  console.error(err);
+  if (!res.headersSent) res.status(500).json({ error: 'Error interno' });
+});
+
 // ── SSE endpoint ─────────────────────────────────────────────────────────────
-app.get('/api/projects/:id/stream', (req, res) => {
+app.get('/api/projects/:id/stream', h(async (req, res) => {
   const { id } = req.params;
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -76,7 +80,7 @@ app.get('/api/projects/:id/stream', (req, res) => {
   clients.get(id).add(res);
 
   // Send current state immediately on connect
-  const project = loadProject(id);
+  const project = await loadProject(id);
   if (project) res.write(`data: ${JSON.stringify({ type: 'sync', project })}\n\n`);
 
   // Keepalive every 25s
@@ -87,17 +91,17 @@ app.get('/api/projects/:id/stream', (req, res) => {
     const pool = clients.get(id);
     if (pool) { pool.delete(res); if (!pool.size) clients.delete(id); }
   });
-});
+}));
 
 // ── Projects CRUD ─────────────────────────────────────────────────────────────
-app.get('/api/projects', (_req, res) => {
-  res.json(listProjects());
-});
+app.get('/api/projects', h(async (_req, res) => {
+  res.json(await listProjects());
+}));
 
-app.post('/api/projects', (req, res) => {
+app.post('/api/projects', h(async (req, res) => {
   const { id, name, createdBy } = req.body;
   if (!id || !name) return res.status(400).json({ error: 'id y name requeridos' });
-  if (loadProject(id)) return res.status(409).json({ error: 'Proyecto ya existe' });
+  if (await loadProject(id)) return res.status(409).json({ error: 'Proyecto ya existe' });
 
   const project = {
     id,
@@ -106,22 +110,22 @@ app.post('/api/projects', (req, res) => {
     createdAt: new Date().toISOString(),
     entries:   []
   };
-  saveProject(id, project);
+  await saveProject(id, project);
   res.json(project);
-});
+}));
 
-app.delete('/api/projects/:id', (req, res) => {
+app.delete('/api/projects/:id', h(async (req, res) => {
   const { id } = req.params;
-  const file = projectFile(id);
-  if (!fs.existsSync(file)) return res.status(404).json({ error: 'No existe' });
-  fs.unlinkSync(file);
+  const project = await loadProject(id);
+  if (!project) return res.status(404).json({ error: 'No existe' });
+  await deleteProjectRow(id);
   res.json({ ok: true });
-});
+}));
 
 // ── Entries ───────────────────────────────────────────────────────────────────
 // Add or accumulate entry
-app.post('/api/projects/:id/entries', (req, res) => {
-  const project = loadProject(req.params.id);
+app.post('/api/projects/:id/entries', h(async (req, res) => {
+  const project = await loadProject(req.params.id);
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
   const entry = req.body; // { id, ref, desc, tipo, subtipo, fechaVenc, comentario, qty, ts, user }
@@ -140,14 +144,14 @@ app.post('/api/projects/:id/entries', (req, res) => {
     project.entries.unshift(entry);
   }
 
-  saveProject(project.id, project);
+  await saveProject(project.id, project);
   broadcast(project.id, { type: 'entries', entries: project.entries });
   res.json({ ok: true, entries: project.entries });
-});
+}));
 
 // Edit entry
-app.put('/api/projects/:id/entries/:entryId', (req, res) => {
-  const project = loadProject(req.params.id);
+app.put('/api/projects/:id/entries/:entryId', h(async (req, res) => {
+  const project = await loadProject(req.params.id);
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
   const idx = project.entries.findIndex(e => e.id === req.params.entryId);
@@ -169,58 +173,23 @@ app.put('/api/projects/:id/entries/:entryId', (req, res) => {
     project.entries[idx] = updated;
   }
 
-  saveProject(project.id, project);
+  await saveProject(project.id, project);
   broadcast(project.id, { type: 'entries', entries: project.entries });
   res.json({ ok: true, entries: project.entries });
-});
+}));
 
 // Delete entry
-app.delete('/api/projects/:id/entries/:entryId', (req, res) => {
-  const project = loadProject(req.params.id);
+app.delete('/api/projects/:id/entries/:entryId', h(async (req, res) => {
+  const project = await loadProject(req.params.id);
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
   project.entries = project.entries.filter(e => e.id !== req.params.entryId);
-  saveProject(project.id, project);
+  await saveProject(project.id, project);
   broadcast(project.id, { type: 'entries', entries: project.entries });
   res.json({ ok: true });
-});
-
-// ── Catálogos: subida y estado ────────────────────────────────────────────────
-// POST /api/catalogs  — sube uno o más xlsx (campo "files")
-app.post('/api/catalogs', (req, res) => {
-  uploadCatalog.array('files', 3)(req, res, (err) => {
-    if (err) return res.status(400).json({ error: err.message });
-    if (!req.files || !req.files.length)
-      return res.status(400).json({ error: 'No se recibió ningún archivo' });
-
-    const saved = req.files.map(f => ({
-      name: f.originalname,
-      size: f.size,
-      savedAt: new Date().toISOString(),
-    }));
-    console.log('[GDSMapiX] Catálogos actualizados:', saved.map(s => s.name).join(', '));
-    res.json({ ok: true, files: saved });
-  });
-});
-
-// GET /api/catalogs — devuelve el estado actual de los catálogos en el servidor
-app.get('/api/catalogs', (_req, res) => {
-  const CATALOG_FILES = ['variables.xlsx', 'referencia.xlsx'];
-  const status = CATALOG_FILES.map(name => {
-    const filePath = path.join(PUBLIC, name);
-    try {
-      const stat = fs.statSync(filePath);
-      return { name, exists: true, size: stat.size, updatedAt: stat.mtime.toISOString() };
-    } catch (_) {
-      return { name, exists: false };
-    }
-  });
-  res.json(status);
-});
+}));
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
-
 app.listen(PORT, () => {
   console.log(`\n  GDSMapiX corriendo en http://localhost:${PORT}\n`);
 });
